@@ -1,0 +1,1033 @@
+# Install Node.js in Colab
+
+!apt-get update
+!apt-get install -y nodejs npm
+!node --version
+!npm --version
+
+# Install ngrok for exposing the server
+!wget https://bin.equinox.io/c/4VmDzA7iaHb/ngrok-stable-linux-amd64.zip
+!unzip -o ngrok-stable-linux-amd64.zip
+
+# Create project directories
+
+!mkdir -p community-platform/backend/src/{config,controllers,middleware,routes,utils}
+!mkdir -p community-platform/backend/uploads
+!mkdir -p community-platform/frontend/{css,js,pages}
+
+#create backend file
+
+%%writefile community-platform/package.json
+{
+  "name": "community-platform",
+  "version": "1.0.0",
+  "description": "Community Platform",
+  "main": "backend/server.js",
+  "scripts": {
+    "start": "node backend/server.js"
+  },
+  "dependencies": {
+    "express": "^4.18.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.3.1",
+    "bcryptjs": "^2.4.3",
+    "jsonwebtoken": "^9.0.2",
+    "sqlite3": "^5.1.6",
+    "multer": "^1.4.5-lts.1"
+  }
+}
+
+%%writefile community-platform/backend/server.js
+const express = require('express');
+const cors = require('cors');
+const path = require('path');
+const sqlite3 = require('sqlite3').verbose();
+const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
+const multer = require('multer');
+
+const app = express();
+const PORT = 5000;
+const JWT_SECRET = 'your-secret-key';
+
+// Middleware
+app.use(cors());
+app.use(express.json());
+app.use(express.static(path.join(__dirname, '../frontend')));
+app.use('/uploads', express.static(path.join(__dirname, 'uploads')));
+
+// Database setup
+const db = new sqlite3.Database(':memory:');
+
+// Initialize database tables
+db.serialize(() => {
+  // Users table
+  db.run(`CREATE TABLE users (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    email TEXT UNIQUE NOT NULL,
+    password TEXT NOT NULL,
+    role TEXT DEFAULT 'user',
+    avatar TEXT,
+    bio TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+  )`);
+
+  // Communities table
+  db.run(`CREATE TABLE communities (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT NOT NULL,
+    description TEXT,
+    lead_id INTEGER,
+    avatar TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (lead_id) REFERENCES users(id)
+  )`);
+
+  // Posts table
+  db.run(`CREATE TABLE posts (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER,
+    community_id INTEGER,
+    content TEXT NOT NULL,
+    media_url TEXT,
+    likes INTEGER DEFAULT 0,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES users(id),
+    FOREIGN KEY (community_id) REFERENCES communities(id)
+  )`);
+
+  // Events table
+  db.run(`CREATE TABLE events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    community_id INTEGER,
+    title TEXT NOT NULL,
+    description TEXT,
+    location TEXT,
+    event_date DATETIME,
+    created_by INTEGER,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (community_id) REFERENCES communities(id),
+    FOREIGN KEY (created_by) REFERENCES users(id)
+  )`);
+
+  console.log('Database initialized');
+});
+
+// File upload setup
+const storage = multer.diskStorage({
+  destination: (req, file, cb) => {
+    cb(null, 'backend/uploads/');
+  },
+  filename: (req, file, cb) => {
+    cb(null, Date.now() + '-' + file.originalname);
+  }
+});
+const upload = multer({ storage });
+
+// Auth middleware
+const authMiddleware = (req, res, next) => {
+  const token = req.header('Authorization')?.replace('Bearer ', '');
+  if (!token) {
+    return res.status(401).json({ error: 'No token provided' });
+  }
+  try {
+    const decoded = jwt.verify(token, JWT_SECRET);
+    req.user = decoded;
+    next();
+  } catch (error) {
+    res.status(401).json({ error: 'Invalid token' });
+  }
+};
+
+// Routes
+// Auth routes
+app.post('/api/auth/register', async (req, res) => {
+  const { name, email, password } = req.body;
+  
+  try {
+    const hashedPassword = await bcrypt.hash(password, 10);
+    
+    db.run(
+      'INSERT INTO users (name, email, password) VALUES (?, ?, ?)',
+      [name, email, hashedPassword],
+      function(err) {
+        if (err) {
+          return res.status(400).json({ error: 'Email already exists' });
+        }
+        
+        const token = jwt.sign({ id: this.lastID, email, role: 'user' }, JWT_SECRET);
+        res.json({
+          token,
+          user: { id: this.lastID, name, email, role: 'user' }
+        });
+      }
+    );
+  } catch (error) {
+    res.status(500).json({ error: 'Server error' });
+  }
+});
+
+app.post('/api/auth/login', async (req, res) => {
+  const { email, password } = req.body;
+  
+  db.get('SELECT * FROM users WHERE email = ?', [email], async (err, user) => {
+    if (err || !user) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+    
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(400).json({ error: 'Invalid credentials' });
+    }
+    
+    const token = jwt.sign({ id: user.id, email: user.email, role: user.role }, JWT_SECRET);
+    delete user.password;
+    res.json({ token, user });
+  });
+});
+
+// Posts routes
+app.get('/api/posts', (req, res) => {
+  db.all(`
+    SELECT p.*, u.name as author_name, u.avatar as author_avatar
+    FROM posts p
+    JOIN users u ON p.user_id = u.id
+    ORDER BY p.created_at DESC
+  `, (err, posts) => {
+    if (err) {
+      return res.status(500).json({ error: 'Server error' });
+    }
+    res.json(posts);
+  });
+});
+
+app.post('/api/posts', authMiddleware, upload.single('image'), (req, res) => {
+  const { content, community_id } = req.body;
+  const media_url = req.file ? `/uploads/${req.file.filename}` : null;
+  
+  db.run(
+    'INSERT INTO posts (user_id, community_id, content, media_url) VALUES (?, ?, ?, ?)',
+    [req.user.id, community_id || null, content, media_url],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Server error' });
+      }
+      res.json({ id: this.lastID, message: 'Post created successfully' });
+    }
+  );
+});
+
+// Communities routes
+app.get('/api/communities', (req, res) => {
+  db.all('SELECT * FROM communities ORDER BY created_at DESC', (err, communities) => {
+    if (err) {
+      return res.status(500).json({ error: 'Server error' });
+    }
+    res.json(communities);
+  });
+});
+
+app.post('/api/communities', authMiddleware, (req, res) => {
+  const { name, description } = req.body;
+  
+  db.run(
+    'INSERT INTO communities (name, description, lead_id) VALUES (?, ?, ?)',
+    [name, description, req.user.id],
+    function(err) {
+      if (err) {
+        return res.status(500).json({ error: 'Server error' });
+      }
+      res.json({ id: this.lastID, message: 'Community created successfully' });
+    }
+  );
+});
+
+// Events routes
+app.get('/api/events', (req, res) => {
+  db.all(`
+    SELECT e.*, c.name as community_name
+    FROM events e
+    JOIN communities c ON e.community_id = c.id
+    ORDER BY e.event_date ASC
+  `, (err, events) => {
+    if (err) {
+      return res.status(500).json({ error: 'Server error' });
+    }
+    res.json(events);
+  });
+});
+
+// Serve frontend for all other routes
+app.get('*', (req, res) => {
+  res.sendFile(path.join(__dirname, '../frontend/index.html'));
+});
+
+app.listen(PORT, () => {
+  console.log(\`Server running on port \${PORT}\`);
+});
+
+%%writefile community-platform/frontend/index.html
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Community Platform</title>
+    <link rel="stylesheet" href="css/styles.css">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div id="app">
+        <!-- Login Page -->
+        <div id="loginPage" class="auth-container">
+            <div class="auth-card">
+                <h1 class="auth-title">
+                    <i class="fas fa-users"></i>
+                    Community Hub
+                </h1>
+                <form id="loginForm" class="auth-form">
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="loginEmail" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="loginPassword" class="form-control" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">Login</button>
+                    <p class="auth-switch">
+                        Don't have an account? 
+                        <a href="#" onclick="showRegister()">Register</a>
+                    </p>
+                </form>
+            </div>
+        </div>
+
+        <!-- Register Page -->
+        <div id="registerPage" class="auth-container" style="display: none;">
+            <div class="auth-card">
+                <h1 class="auth-title">
+                    <i class="fas fa-users"></i>
+                    Join Community Hub
+                </h1>
+                <form id="registerForm" class="auth-form">
+                    <div class="form-group">
+                        <label>Name</label>
+                        <input type="text" id="registerName" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Email</label>
+                        <input type="email" id="registerEmail" class="form-control" required>
+                    </div>
+                    <div class="form-group">
+                        <label>Password</label>
+                        <input type="password" id="registerPassword" class="form-control" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary btn-block">Register</button>
+                    <p class="auth-switch">
+                        Already have an account? 
+                        <a href="#" onclick="showLogin()">Login</a>
+                    </p>
+                </form>
+            </div>
+        </div>
+
+        <!-- Main App -->
+        <div id="mainApp" style="display: none;">
+            <!-- Navigation -->
+            <nav class="navbar">
+                <div class="nav-container">
+                    <div class="nav-brand">
+                        <i class="fas fa-users"></i>
+                        <span>Community Hub</span>
+                    </div>
+                    <div class="nav-menu">
+                        <a href="#" onclick="showFeed()" class="nav-link active">
+                            <i class="fas fa-home"></i>
+                            <span>Feed</span>
+                        </a>
+                        <a href="#" onclick="showCommunities()" class="nav-link">
+                            <i class="fas fa-layer-group"></i>
+                            <span>Communities</span>
+                        </a>
+                        <a href="#" onclick="showEvents()" class="nav-link">
+                            <i class="fas fa-calendar"></i>
+                            <span>Events</span>
+                        </a>
+                    </div>
+                    <div class="nav-actions">
+                        <button class="btn btn-primary" onclick="logout()">Logout</button>
+                    </div>
+                </div>
+            </nav>
+
+            <!-- Content -->
+            <main id="content" class="main-content">
+                <!-- Dynamic content -->
+            </main>
+
+            <!-- Create Post Button -->
+            <button class="fab" onclick="showCreatePost()">
+                <i class="fas fa-plus"></i>
+            </button>
+        </div>
+    </div>
+
+    <script src="js/app.js"></script>
+</body>
+</html>
+
+#create css
+%%writefile community-platform/frontend/css/styles.css
+:root {
+  --primary: #6366f1;
+  --secondary: #8b5cf6;
+  --success: #10b981;
+  --danger: #ef4444;
+  --dark: #1f2937;
+  --light: #f3f4f6;
+  --white: #ffffff;
+  --gray: #6b7280;
+  --shadow: 0 1px 3px rgba(0,0,0,0.1);
+  --shadow-lg: 0 10px 15px rgba(0,0,0,0.1);
+}
+
+* {
+  margin: 0;
+  padding: 0;
+  box-sizing: border-box;
+}
+
+body {
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  background-color: var(--light);
+  color: var(--dark);
+  line-height: 1.6;
+}
+
+/* Auth Styles */
+.auth-container {
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(135deg, var(--primary), var(--secondary));
+}
+
+.auth-card {
+  background: var(--white);
+  padding: 2rem;
+  border-radius: 1rem;
+  box-shadow: var(--shadow-lg);
+  width: 100%;
+  max-width: 400px;
+}
+
+.auth-title {
+  text
+
+#create javascriptfile app
+%%writefile community-platform/frontend/js/app.js
+// Global variables
+let currentUser = null;
+let authToken = null;
+
+// API Base URL (will be updated with ngrok URL)
+let API_URL = 'http://localhost:5000';
+
+// Auth Functions
+function showLogin() {
+    document.getElementById('loginPage').style.display = 'flex';
+    document.getElementById('registerPage').style.display = 'none';
+    document.getElementById('mainApp').style.display = 'none';
+}
+
+function showRegister() {
+    document.getElementById('loginPage').style.display = 'none';
+    document.getElementById('registerPage').style.display = 'flex';
+    document.getElementById('mainApp').style.display = 'none';
+}
+
+function showApp() {
+    document.getElementById('loginPage').style.display = 'none';
+    document.getElementById('registerPage').style.display = 'none';
+    document.getElementById('mainApp').style.display = 'block';
+    showFeed();
+}
+
+// Login
+document.getElementById('loginForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const email = document.getElementById('loginEmail').value;
+    const password = document.getElementById('loginPassword').value;
+
+    try {
+        const response = await fetch(`${API_URL}/api/auth/login`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ email, password })
+        });
+
+        const data = await response.json();
+        if (response.ok) {
+            authToken = data.token;
+            currentUser = data.user;
+            localStorage.setItem('authToken', authToken);
+            localStorage.setItem('currentUser', JSON.stringify(currentUser));
+            showApp();
+        } else {
+            alert(data.error || 'Login failed');
+        }
+    } catch (error) {
+        alert('Network error. Please try again.');
+    }
+});
+
+// Register
+document.getElementById('registerForm')?.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const name = document.getElementById('registerName').value;
+    const email = document.getElementById('registerEmail').value;
+    const password = document.getElementById('registerPassword').value;
+
+    try {
+        const response = await fetch(`${API_URL}/api/auth/register`, {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ name, email, password })
+        });
+
+        const data = await response.json();
+        if (response.ok) {
+            authToken = data.token;
+            currentUser = data.user;
+            localStorage.setItem('authToken', authToken);
+            localStorage.setItem('currentUser', JSON.stringify(currentUser));
+            showApp();
+        } else {
+            alert(data.error || 'Registration failed');
+        }
+    } catch (error) {
+        alert('Network error. Please try again.');
+    }
+});
+
+// Logout
+function logout() {
+    authToken = null;
+    currentUser = null;
+    localStorage.removeItem('authToken');
+    localStorage.removeItem('currentUser');
+    showLogin();
+}
+
+// Feed Functions
+async function showFeed() {
+    setActiveNav('Feed');
+    const content = document.getElementById('content');
+    content.innerHTML = '<div class="loading">Loading posts...</div>';
+
+    try {
+        const response = await fetch(`${API_URL}/api/posts`);
+        const posts = await response.json();
+
+        content.innerHTML = `
+            <div class="feed-container">
+                <h1>Community Feed</h1>
+                <div id="postsContainer">
+                    ${posts.length ? posts.map(post => createPostHTML(post)).join('') : '<p>No posts yet. Be the first to post!</p>'}
+                </div>
+            </div>
+        `;
+    } catch (error) {
+        content.innerHTML = '<p>Error loading posts. Please try again.</p>';
+    }
+}
+
+function createPostHTML(post) {
+    return `
+        <div class="post-card">
+            <div class="post-header">
+                <img src="${post.author_avatar || 'https://ui-avatars.com/api/?name=' + post.author_name}" class="post-avatar">
+                <div class="post-meta">
+                    <div class="post-author">${post.author_name}</div>
+                    <div class="post-time">${new Date(post.created_at).toLocaleDateString()}</div>
+                </div>
+            </div>
+            <div class="post-content">
+                <p>${post.content}</p>
+                ${post.media_url ? `<img src="${API_URL}${post.media_url}" class="post-image">` : ''}
+            </div>
+            <div class="post-actions">
+                <button class="post-action" onclick="likePost(${post.id})">
+                    <i class="far fa-heart"></i> ${post.likes || 0}
+                </button>
+                <button class="post-action">
+                    <i class="far fa-comment"></i> Comment
+                </button>
+                <button class="post-action">
+                    <i class="far fa-share"></i> Share
+                </button>
+            </div>
+        </div>
+    `;
+}
+
+// Communities Functions
+async function showCommunities() {
+    setActiveNav('Communities');
+    const content = document.getElementById('content');
+    content.innerHTML = '<div class="loading">Loading communities...</div>';
+
+    try {
+        const response = await fetch(`${API_URL}/api/communities`);
+        const communities = await response.json();
+
+        content.innerHTML = `
+            <div class="communities-container">
+                <div class="section-header">
+                    <h1>Communities</h1>
+                    <button class="btn btn-primary" onclick="showCreateCommunity()">
+                        <i class="fas fa-plus"></i> Create Community
+                    </button>
+                </div>
+                <div class="communities-grid">
+                    ${communities.length ? communities.map(community => createCommunityHTML(community)).join('') : '<p>No communities yet. Create the first one!</p>'}
+                </div>
+            </div>
+        `;
+    } catch (error) {
+        content.innerHTML = '<p>Error loading communities. Please try again.</p>';
+    }
+}
+
+function createCommunityHTML(community) {
+    return `
+        <div class="community-card">
+            <img src="${community.avatar || 'https://ui-avatars.com/api/?name=' + community.name}" class="community-avatar">
+            <h3>${community.name}</h3>
+            <p>${community.description || 'No description'}</p>
+            <button class="btn btn-primary btn-sm">Join Community</button>
+        </div>
+    `;
+}
+
+// Events Functions
+async function showEvents() {
+    setActiveNav('Events');
+    const content = document.getElementById('content');
+    content.innerHTML = '<div class="loading">Loading events...</div>';
+
+    try {
+        const response = await fetch(`${API_URL}/api/events`);
+        const events = await response.json();
+
+        content.innerHTML = `
+            <div class="events-container">
+                <h1>Upcoming Events</h1>
+                <div class="events-list">
+                    ${events.length ? events.map(event => createEventHTML(event)).join('') : '<p>No upcoming events.</p>'}
+                </div>
+            </div>
+        `;
+    } catch (error) {
+        content.innerHTML = '<p>Error loading events. Please try again.</p>';
+    }
+}
+
+function createEventHTML(event) {
+    return `
+        <div class="event-card">
+            <div class="event-date">
+                <div class="event-month">${new Date(event.event_date).toLocaleDateString('en-US', { month: 'short' })}</div>
+                <div class="event-day">${new Date(event.event_date).getDate()}</div>
+            </div>
+            <div class="event-details">
+                <h3>${event.title}</h3>
+                <p>${event.description || 'No description'}</p>
+                <p><i class="fas fa-map-marker-alt"></i> ${event.location || 'TBA'}</p>
+                <p><i class="fas fa-users"></i> ${event.community_name}</p>
+            </div>
+            <div class="event-actions">
+                <button class="btn btn-primary">RSVP</button>
+            </div>
+        </div>
+    `;
+}
+
+// Create Post
+function showCreatePost() {
+    const modal = document.createElement('div');
+    modal.className = 'modal';
+    modal.innerHTML = `
+        <div class="modal-content">
+            <div class="modal-header">
+                <h2>Create Post</h2>
+                <button class="btn-icon" onclick="this.closest('.modal').remove()">
+                    <i class="fas fa-times"></i>
+                </button>
+            </div>
+            <form id="createPostForm" class="modal-body">
+                <div class="form-group">
+                    <textarea id="postContent" class="form-control" rows="4" placeholder="What's on your mind?" required></textarea>
+                </div>
+                <div class="form-group">
+                    <input type="file" id="postImage" class="form-control" accept="image/*">
+                </div>
+                <div class="form-actions">
+                    <button type="button" class="btn btn-secondary" onclick="this.closest('.modal').remove()">Cancel</button>
+                    <button type="submit" class="btn btn-primary">Post</button>
+                </div>
+            </form>
+        </div>
+    `;
+    document.body.appendChild(modal);
+
+    document.getElementById('createPostForm').addEventListener('submit', async (e) => {
+        e.preventDefault();
+        const content = document.getElementById('postContent').value;
+        const imageFile = document.getElementById('postImage').files[0];
+
+        const formData = new FormData();
+        formData.append('content', content);
+        if (imageFile) {
+            formData.append('image', imageFile);
+        }
+
+        try {
+            const response = await fetch(`${API_URL}/api/posts`, {
+                method: 'POST',
+                headers: {
+                    'Authorization': `Bearer ${authToken}`
+                },
+                body: formData
+            });
+
+            if (response.ok) {
+                modal.remove();
+                showFeed();
+            } else {
+                alert('Failed to create post');
+            }
+        } catch (error) {
+            alert('Network error. Please try again.');
+        }
+    });
+}
+
+// Helper Functions
+function setActiveNav(section) {
+    document.querySelectorAll('.nav-link').forEach(link => {
+        link.classList.remove('active');
+        if (link.textContent.includes(section)) {
+            link.classList.add('active');
+        }
+    });
+}
+
+// Check for existing session
+window.addEventListener('DOMContentLoaded', () => {
+    const savedToken = localStorage.getItem('authToken');
+    const savedUser = localStorage.getItem('currentUser');
+    
+    if (savedToken && savedUser) {
+        authToken = savedToken;
+        currentUser = JSON.parse(savedUser);
+        showApp();
+    } else {
+        showLogin();
+    }
+});
+
+#complete css
+%%writefile -a community-platform/frontend/css/styles.css
+
+.auth-title {
+  text-align: center;
+  color: var(--primary);
+  margin-bottom: 2rem;
+}
+
+.auth-form {
+  margin-top: 1rem;
+}
+
+.auth-switch {
+  text-align: center;
+  margin-top: 1rem;
+  color: var(--gray);
+}
+
+.auth-switch a {
+  color: var(--primary);
+  text-decoration: none;
+}
+
+/* Navbar */
+.navbar {
+  background: var(--white);
+  box-shadow: var(--shadow);
+  position: sticky;
+  top: 0;
+  z-index: 100;
+}
+
+.nav-container {
+  max-width: 1200px;
+  margin: 0 auto;
+  padding: 1rem;
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+}
+
+.nav-brand {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  font-size: 1.5rem;
+  font-weight: bold;
+  color: var(--primary);
+}
+
+.nav-menu {
+  display: flex;
+  gap: 2rem;
+}
+
+.nav-link {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem;
+  color: var(--gray);
+  text-decoration: none;
+  padding: 0.5rem 1rem;
+  border-radius: 0.5rem;
+  transition: all 0.3s;
+}
+
+.nav-link:hover,
+.nav-link.active {
+  color: var(--primary);
+  background: rgba(99, 102, 241, 0.1);
+}
+
+/* Main Content */
+.main-content {
+  max-width: 800px;
+  margin: 2rem auto;
+  padding: 0 1rem;
+}
+
+/* Forms */
+.form-group {
+  margin-bottom: 1rem;
+}
+
+.form-group label {
+  display: block;
+  margin-bottom: 0.5rem;
+  font-weight: 500;
+}
+
+.form-control {
+  width: 100%;
+  padding: 0.75rem;
+  border: 1px solid #e5e7eb;
+  border-radius: 0.5rem;
+  font-size: 1rem;
+}
+
+.form-control:focus {
+  outline: none;
+  border-color: var(--primary);
+}
+
+/* Buttons */
+.btn {
+  padding: 0.75rem 1.5rem;
+  border: none;
+  border-radius: 0.5rem;
+  font-size: 1rem;
+  cursor: pointer;
+  transition: all 0.3s;
+  display: inline-flex;
+  align-items: center;
+  gap: 0.5rem;
+}
+
+.btn-primary {
+  background: var(--primary);
+  color: white;
+}
+
+.btn-primary:hover {
+  background: var(--secondary);
+  transform: translateY(-2px);
+}
+
+.btn-secondary {
+  background: var(--light);
+  color: var(--dark);
+}
+
+.btn-block {
+  width: 100%;
+  justify-content: center;
+}
+
+.btn-icon {
+  background: none;
+  border: none;
+  padding: 0.5rem;
+  cursor: pointer;
+  color: var(--gray);
+}
+
+/* Posts */
+.post-card {
+  background: var(--white);
+  border-radius: 1rem;
+  box-shadow: var(--shadow);
+  margin-bottom: 1.5rem;
+  overflow: hidden;
+}
+
+.post-header {
+  padding: 1rem;
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+
+.post-avatar {
+  width: 48px;
+  height: 48px;
+  border-radius: 50%;
+  object-fit: cover;
+}
+
+.post-author {
+  font-weight: 600;
+}
+
+.post-time {
+  font-size: 0.875rem;
+  color: var(--gray);
+}
+
+.post-content {
+  padding: 0 1rem 1rem;
+}
+
+.post-image {
+  width: 100%;
+  margin-top: 1rem;
+  border-radius: 0.5rem;
+}
+
+.post-actions {
+  padding: 1rem;
+  border-top: 1px solid var(--light);
+  display: flex;
+  gap: 2rem;
+}
+
+#install deependencies and start server
+
+# Change to project directory and install dependencies
+!cd community-platform && npm install
+
+# Create a simple run script
+%%writefile community-platform/run_server.py
+import subprocess
+import time
+from threading import Thread
+
+def run_server():
+    subprocess.run(['node', 'backend/server.js'], cwd='community-platform')
+
+# Start the server in background
+thread = Thread(target=run_server)
+thread.daemon = True
+thread.start()
+
+print("Server starting... Please wait 5 seconds")
+time.sleep(5)
+
+#set up ngrok
+# Get auth token (you'll need to sign up for free at ngrok.com)
+# For now, we'll use it without auth token (limited to 2 hours)
+
+from subprocess import Popen, PIPE
+import json
+import time
+
+# Kill any existing ngrok processes
+!pkill -f ngrok
+
+# Start ngrok
+ngrok_process = Popen(['./ngrok', 'http', '5000'], stdout=PIPE, stderr=PIPE)
+time.sleep(3)
+
+# Get the public URL
+!curl -s http://localhost:4040/api/tunnels > tunnels.json
+
+with open('tunnels.json', 'r') as f:
+    data = json.load(f)
+    public_url = data['tunnels'][0]['public_url']
+    
+print(f"🎉 Your app is live at: {public_url}")
+print(f"📱 Share this URL to access from any device!")
+print(f"⏰ This URL will work for 2 hours (ngrok free tier)")
+
+#update frontend using ngrok
+
+# Update the API URL in the frontend
+public_url = !curl -s http://localhost:4040/api/tunnels | python3 -c "import sys, json; print(json.load(sys.stdin)['tunnels'][0]['public_url'])"
+public_url = public_url[0]
+
+# Read the current app.js
+with open('community-platform/frontend/js/app.js', 'r') as f:
+    content = f.read()
+
+# Replace the API_URL
+import re
+content = re.sub(r"let API_URL = '[^']*'", f"let API_URL = '{public_url}'", content)
+
+# Write back
+with open('community-platform/frontend/js/app.js', 'w') as f:
+    f.write(content)
+
+print(f"✅ Frontend updated with API URL: {public_url}")
+
+#create some text data optional
+
+import requests
+import json
+
+# Create test users and posts
+test_users = [
+    {"name": "John Doe", "email": "john@example.com", "password": "password123"},
+    {"name": "Jane Smith", "email": "jane@example.com", "password": "password123"},
+    {"name": "Admin User", "email": "admin@example.com", "password": "admin123"}
+]
+
+print("Creating test users...")
+for user in test_users:
+    try:
+        response = requests.post(f"{public_url}/api/auth/register", json=user)
+        if response.status_code == 200:
+            print(f"✅ Created user: {user['name']}")
+        else:
+            print(f"❌ Failed to create user: {user['name']}")
+    except:
+        pass
+
+print("\n🎉 Setup complete! Access your app at:", public_url)
+
+#monitor server data log
+
+# View server logs
+!cd community-platform && tail -f server.log
