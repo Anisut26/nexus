@@ -1,0 +1,33 @@
+community-platform/
+├── backend/
+│   ├── src/
+│   │   ├── config/
+│   │   │   └── database.js
+│   │   ├── controllers/
+│   │   │   ├── auth.controller.js
+│   │   │   ├── post.controller.js
+│   │   │   ├── community.controller.js
+│   │   │   └── event.controller.js
+│   │   ├── middleware/
+│   │   │   └── auth.js
+│   │   ├── routes/
+│   │   │   ├── auth.routes.js
+│   │   │   ├── post.routes.js
+│   │   │   ├── community.routes.js
+│   │   │   └── event.routes.js
+│   │   └── utils/
+│   ├── uploads/
+│   └── server.js
+├── frontend/
+│   ├── css/
+│   │   └── styles.css
+│   ├── js/
+│   │   ├── config.js
+│   │   ├── api.js
+│   │   ├── auth.js
+│   │   ├── router.js
+│   │   └── app.js
+│   └── index.html
+├── .env
+├── package.json
+└── .replit
